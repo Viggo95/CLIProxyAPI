@@ -77,7 +77,10 @@ jobs:
           rc=$?
           tail -n 150 logs-A.txt
           if grep -q 'panic: test timed out' logs-A.txt; then
-            verdict='DEADLOCK'; detail='test binary hit its own -timeout; goroutine dump in logs-A.txt'
+            w=$(grep -c 'net\.(\*conn)\.Write' logs-A.txt)
+            t=$(grep -m1 -E '^[A-Za-z]*Test[A-Za-z_]*Bootstrap[A-Za-z_]*' logs-A.txt | head -1)
+            verdict='DEADLOCK'
+            detail="binary hit its own -timeout after 8m; goroutines parked in net.conn.Write: $w; running test at timeout: ${t:-unknown}"
           elif [ "$rc" -eq 0 ]; then
             verdict='pass'; detail='package completed'
           else
@@ -95,7 +98,10 @@ jobs:
           rc=$?
           tail -n 150 logs-B.txt
           if grep -q 'panic: test timed out' logs-B.txt; then
-            verdict='DEADLOCK'; detail='hung in teardown; look for net.(*conn).Write + server.Close in logs-B.txt'
+            w=$(grep -c 'net\.(\*conn)\.Write' logs-B.txt)
+            cl=$(grep -c 'httptest.*Close\|closeIdleConns\|Server.Close' logs-B.txt)
+            verdict='DEADLOCK'
+            detail="hung after 4m; goroutines in net.conn.Write: $w; frames mentioning Server.Close: $cl"
           elif [ "$rc" -eq 0 ]; then
             verdict='pass'; detail='20/20 iterations'
           else
@@ -179,6 +185,10 @@ jobs:
               [ -n "$a" ] && echo "| $a | $b | **$c** | $d |"
             done < results.tsv
           } >> "$GITHUB_STEP_SUMMARY"
+          while IFS=$'\t' read -r a b c d; do
+            [ -n "$a" ] || continue
+            echo "::notice title=5981 ${{ matrix.slug }} step $a::[${{ matrix.slug }}] $b -> $c ; $d"
+          done < results.tsv
           cat results.tsv
           exit 0
 
