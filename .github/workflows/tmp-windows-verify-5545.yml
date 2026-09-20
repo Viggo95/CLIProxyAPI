@@ -1,0 +1,299 @@
+# TEMPORARY — verification harness for the #5545 follow-up PR (codex incomplete-stream
+# diagnostics, branch feat/codex-incomplete-stream-diagnostics @ 2f86bfb1).
+# Not for merge: lives only on the tmp/windows-verify-5545 branch of the fork.
+#
+# Why: an earlier PR (#5981/#5984) shipped executor tests that deadlocked ONLY on
+# windows-latest. The new test file adds a manual-clock harness with a scripted
+# httptest upstream, so we want the Windows answer before opening the PR.
+#
+# Two legs:
+#   prB-alone      — the PR commit by itself. Only the NEW tests are run here, because
+#                    the whole executor package at this commit still contains the
+#                    pre-existing Windows deadlock in ByteCapReleasesStream (fixed by
+#                    #5984 / ec81c0c4, which this commit does not carry).
+#   prB-plus-5984  — the merge commit (PR B + #5984's test fix). Here the WHOLE package
+#                    is run: with the known deadlock fixed, it must complete on Windows.
+name: tmp-windows-verify-5545
+
+on:
+  push:
+    branches:
+      - tmp/windows-verify-5545
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: ${{ matrix.label }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: prB-alone
+            label: prB-alone 2f86bfb1
+            ref: 2f86bfb13f1fadeb03908147c3e9a51a07ef582c
+          - slug: prB-plus-5984
+            label: prB+5984 merge
+            ref: ${{ github.sha }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The ten new tests all carry IncompleteStream in their name and nothing else in the
+      # package does, so this selects exactly the new file.
+      NEW_TESTS: 'IncompleteStream'
+      # The one assertion PR B adds outside the executor package.
+      WS_TEST: 'ResponsesWebsocketPinnedAuth'
+
+    steps:
+      - name: Checkout ${{ matrix.ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Environment probe
+        run: |
+          set +e
+          go version
+          go env GOOS GOARCH CGO_ENABLED
+          echo "cpus: $(nproc 2>/dev/null || echo '?')"
+          echo "head: $(git rev-parse HEAD)"
+          if gcc --version >/dev/null 2>&1; then
+            gcc --version | head -1
+            echo "RACE=-race" >> "$GITHUB_ENV"
+          else
+            echo "no gcc on PATH -> running WITHOUT -race; deadlocks and assertion"
+            echo "failures still show, only data-race reports are lost"
+            echo "RACE=" >> "$GITHUB_ENV"
+          fi
+          : > results.tsv
+          exit 0
+
+      # ---------------------------------------------------------------- prB-alone
+
+      - name: 'A. go vet both packages'
+        if: matrix.slug == 'prB-alone'
+        timeout-minutes: 8
+        run: |
+          set +e
+          go vet ./internal/runtime/executor/ ./sdk/api/handlers/openai/ > logs-A.txt 2>&1
+          rc=$?
+          tail -n 80 logs-A.txt
+          if [ "$rc" -eq 0 ]; then verdict='pass'; detail='clean'; else verdict='FAIL'; detail="exit $rc: $(grep -m3 -v '^#' logs-A.txt | tr '\n' ' ' | cut -c1-200)"; fi
+          printf 'A\tgo vet executor + openai handlers\t%s\t%s\n' "$verdict" "$detail" >> results.tsv
+          exit 0
+
+      - name: 'B. new tests isolated, -count=20'
+        if: matrix.slug == 'prB-alone'
+        timeout-minutes: 9
+        run: |
+          set +e
+          start=$(date +%s)
+          go test $RACE -count=20 -timeout 6m -run "$NEW_TESTS" ./internal/runtime/executor/ > logs-B.txt 2>&1
+          rc=$?; el=$(( $(date +%s) - start ))
+          tail -n 150 logs-B.txt
+          if grep -q 'panic: test timed out' logs-B.txt; then
+            w=$(grep -c 'net\.(\*conn)\.Write' logs-B.txt)
+            t=$(sed -n '/running tests:/,+4p' logs-B.txt | grep -m1 -oE 'Test[A-Za-z0-9_]+')
+            verdict='DEADLOCK'; detail="hit -timeout 6m after ${el}s; goroutines in net.conn.Write: $w; running test: ${t:-unknown}"
+          elif grep -q 'WARNING: DATA RACE' logs-B.txt; then
+            verdict='RACE'; detail="data race after ${el}s; $(grep -m1 -A3 'WARNING: DATA RACE' logs-B.txt | tr '\n' ' ' | cut -c1-180)"
+          elif [ "$rc" -eq 0 ]; then
+            verdict='pass'; detail="20/20 iterations in ${el}s"
+          else
+            verdict='FAIL'; detail="exit $rc after ${el}s; $(grep -m3 -- '--- FAIL' logs-B.txt | tr '\n' ' ' | cut -c1-200)"
+          fi
+          printf 'B\tnew tests isolated, -count=20 %s\t%s\t%s\n' "${RACE:-norace}" "$verdict" "$detail" >> results.tsv
+          exit 0
+
+      - name: 'C. new tests, 4 concurrent x -count=30, 3 reps (loaded box)'
+        if: matrix.slug == 'prB-alone'
+        timeout-minutes: 22
+        run: |
+          set +e
+          start=$(date +%s)
+          total=0; green=0; dead=0
+          for rep in 1 2 3; do
+            pids=''
+            for i in 1 2 3 4; do
+              go test $RACE -count=30 -timeout 6m -run "$NEW_TESTS" ./internal/runtime/executor/ > "logs-C-$rep-$i.txt" 2>&1 &
+              pids="$pids $!"
+            done
+            for p in $pids; do
+              total=$((total+1)); wait "$p"
+              if [ $? -eq 0 ]; then green=$((green+1)); fi
+            done
+          done
+          el=$(( $(date +%s) - start ))
+          dead=$(grep -l 'panic: test timed out' logs-C-*.txt 2>/dev/null | wc -l | tr -d ' ')
+          races=$(grep -l 'WARNING: DATA RACE' logs-C-*.txt 2>/dev/null | wc -l | tr -d ' ')
+          echo "green $green/$total ; deadlocked $dead ; raced $races ; ${el}s"
+          grep -hE -- '--- FAIL' logs-C-*.txt 2>/dev/null | sort -u | head -20
+          if [ "$dead" -gt 0 ]; then verdict='DEADLOCK'
+          elif [ "$races" -gt 0 ]; then verdict='RACE'
+          elif [ "$green" -eq "$total" ]; then verdict='pass'
+          else verdict='FAIL'; fi
+          printf 'C\tnew tests, 4 procs x -count=30, 3 reps\t%s\tgreen %s/%s in %ss; deadlocked %s; raced %s\n' "$verdict" "$green" "$total" "$el" "$dead" "$races" >> results.tsv
+          exit 0
+
+      - name: 'D. new tests, -count=10 -shuffle=on'
+        if: matrix.slug == 'prB-alone'
+        timeout-minutes: 9
+        run: |
+          set +e
+          start=$(date +%s)
+          go test $RACE -count=10 -shuffle=on -timeout 6m -run "$NEW_TESTS" ./internal/runtime/executor/ > logs-D.txt 2>&1
+          rc=$?; el=$(( $(date +%s) - start ))
+          tail -n 150 logs-D.txt
+          seed=$(grep -m1 -oE '\-test\.shuffle [0-9]+' logs-D.txt)
+          if grep -q 'panic: test timed out' logs-D.txt; then
+            w=$(grep -c 'net\.(\*conn)\.Write' logs-D.txt)
+            t=$(sed -n '/running tests:/,+4p' logs-D.txt | grep -m1 -oE 'Test[A-Za-z0-9_]+')
+            verdict='DEADLOCK'; detail="hit -timeout 6m after ${el}s; net.conn.Write: $w; running test: ${t:-unknown}; $seed"
+          elif grep -q 'WARNING: DATA RACE' logs-D.txt; then
+            verdict='RACE'; detail="data race after ${el}s; $seed"
+          elif [ "$rc" -eq 0 ]; then
+            verdict='pass'; detail="10/10 shuffled iterations in ${el}s; $seed"
+          else
+            verdict='FAIL'; detail="exit $rc after ${el}s; $seed; $(grep -m3 -- '--- FAIL' logs-D.txt | tr '\n' ' ' | cut -c1-180)"
+          fi
+          printf 'D\tnew tests, -count=10 -shuffle=on\t%s\t%s\n' "$verdict" "$detail" >> results.tsv
+          exit 0
+
+      - name: 'E. websocket assertion PR B touches, -count=3'
+        if: matrix.slug == 'prB-alone'
+        timeout-minutes: 9
+        run: |
+          set +e
+          start=$(date +%s)
+          go test -count=3 -timeout 6m -run "$WS_TEST" ./sdk/api/handlers/openai/ > logs-E.txt 2>&1
+          rc=$?; el=$(( $(date +%s) - start ))
+          tail -n 120 logs-E.txt
+          if grep -q 'panic: test timed out' logs-E.txt; then
+            verdict='DEADLOCK'; detail="hit -timeout 6m after ${el}s; net.conn.Write: $(grep -c 'net\.(\*conn)\.Write' logs-E.txt)"
+          elif [ "$rc" -eq 0 ]; then
+            verdict='pass'; detail="3/3 iterations in ${el}s"
+          else
+            verdict='FAIL'; detail="exit $rc after ${el}s; $(grep -m3 -- '--- FAIL' logs-E.txt | tr '\n' ' ' | cut -c1-200)"
+          fi
+          printf 'E\t%s, -count=3\t%s\t%s\n' "$WS_TEST" "$verdict" "$detail" >> results.tsv
+          exit 0
+
+      # ------------------------------------------------------------ prB-plus-5984
+
+      - name: 'F. WHOLE executor package, -count=1 (reporter repro)'
+        if: matrix.slug == 'prB-plus-5984'
+        timeout-minutes: 11
+        run: |
+          set +e
+          start=$(date +%s)
+          go test -count=1 -timeout 8m ./internal/runtime/executor/ > logs-F.txt 2>&1
+          rc=$?; el=$(( $(date +%s) - start ))
+          tail -n 200 logs-F.txt
+          if grep -q 'panic: test timed out' logs-F.txt; then
+            w=$(grep -c 'net\.(\*conn)\.Write' logs-F.txt)
+            t=$(sed -n '/running tests:/,+6p' logs-F.txt | grep -oE 'Test[A-Za-z0-9_]+' | tr '\n' ',')
+            echo '=== goroutine dump head ==='
+            sed -n '/panic: test timed out/,+60p' logs-F.txt
+            verdict='DEADLOCK'; detail="hit -timeout 8m after ${el}s; net.conn.Write: $w; running tests: ${t:-unknown}"
+          elif [ "$rc" -eq 0 ]; then
+            verdict='pass'; detail="whole package completed in ${el}s"
+          else
+            verdict='FAIL'; detail="exit $rc after ${el}s; $(grep -m5 -- '--- FAIL' logs-F.txt | tr '\n' ' ' | cut -c1-250)"
+          fi
+          printf 'F\twhole executor package, -count=1\t%s\t%s\n' "$verdict" "$detail" >> results.tsv
+          exit 0
+
+      - name: 'G. both packages, -race -count=3'
+        if: matrix.slug == 'prB-plus-5984'
+        timeout-minutes: 12
+        run: |
+          set +e
+          start=$(date +%s)
+          go test $RACE -count=3 -timeout 8m ./internal/runtime/executor/ ./sdk/api/handlers/openai/ > logs-G.txt 2>&1
+          rc=$?; el=$(( $(date +%s) - start ))
+          tail -n 200 logs-G.txt
+          if grep -q 'panic: test timed out' logs-G.txt; then
+            w=$(grep -c 'net\.(\*conn)\.Write' logs-G.txt)
+            t=$(sed -n '/running tests:/,+6p' logs-G.txt | grep -oE 'Test[A-Za-z0-9_]+' | tr '\n' ',')
+            echo '=== goroutine dump head ==='
+            sed -n '/panic: test timed out/,+60p' logs-G.txt
+            verdict='DEADLOCK'; detail="hit -timeout 8m after ${el}s; net.conn.Write: $w; running tests: ${t:-unknown}"
+          elif grep -q 'WARNING: DATA RACE' logs-G.txt; then
+            verdict='RACE'; detail="data race after ${el}s; $(grep -c 'WARNING: DATA RACE' logs-G.txt) report(s)"
+          elif [ "$rc" -eq 0 ]; then
+            verdict='pass'; detail="both packages x3 in ${el}s ${RACE:-norace}"
+          else
+            verdict='FAIL'; detail="exit $rc after ${el}s; $(grep -m5 -- '--- FAIL' logs-G.txt | tr '\n' ' ' | cut -c1-250)"
+          fi
+          printf 'G\tboth packages, %s -count=3\t%s\t%s\n' "${RACE:-norace}" "$verdict" "$detail" >> results.tsv
+          exit 0
+
+      - name: 'H. new tests isolated, -count=20 (post-merge)'
+        if: matrix.slug == 'prB-plus-5984'
+        timeout-minutes: 9
+        run: |
+          set +e
+          start=$(date +%s)
+          go test $RACE -count=20 -timeout 6m -run "$NEW_TESTS" ./internal/runtime/executor/ > logs-H.txt 2>&1
+          rc=$?; el=$(( $(date +%s) - start ))
+          tail -n 150 logs-H.txt
+          if grep -q 'panic: test timed out' logs-H.txt; then
+            w=$(grep -c 'net\.(\*conn)\.Write' logs-H.txt)
+            t=$(sed -n '/running tests:/,+4p' logs-H.txt | grep -m1 -oE 'Test[A-Za-z0-9_]+')
+            verdict='DEADLOCK'; detail="hit -timeout 6m after ${el}s; net.conn.Write: $w; running test: ${t:-unknown}"
+          elif grep -q 'WARNING: DATA RACE' logs-H.txt; then
+            verdict='RACE'; detail="data race after ${el}s"
+          elif [ "$rc" -eq 0 ]; then
+            verdict='pass'; detail="20/20 iterations in ${el}s"
+          else
+            verdict='FAIL'; detail="exit $rc after ${el}s; $(grep -m3 -- '--- FAIL' logs-H.txt | tr '\n' ' ' | cut -c1-200)"
+          fi
+          printf 'H\tnew tests isolated, -count=20 %s\t%s\t%s\n' "${RACE:-norace}" "$verdict" "$detail" >> results.tsv
+          exit 0
+
+      # ------------------------------------------------------------------ verdict
+
+      - name: Summary
+        if: always()
+        run: |
+          set +e
+          {
+            echo "### ${{ matrix.label }}"
+            echo
+            echo "\`windows-latest\`, $(go version 2>/dev/null), race flag: \`${RACE:-<none>}\`"
+            echo
+            echo "| # | protocol | result | detail |"
+            echo "| --- | --- | --- | --- |"
+            while IFS=$'\t' read -r a b c d; do
+              [ -n "$a" ] && echo "| $a | $b | **$c** | $d |"
+            done < results.tsv
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS=$'\t' read -r a b c d; do
+            [ -n "$a" ] || continue
+            echo "::notice title=5545 ${{ matrix.slug }} step $a::[${{ matrix.slug }}] $b -> $c ; $d"
+          done < results.tsv
+          cat results.tsv
+          exit 0
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.slug }}
+          path: |
+            logs-*.txt
+            results.tsv
+          if-no-files-found: warn
+          retention-days: 14
