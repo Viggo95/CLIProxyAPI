@@ -36,9 +36,19 @@ jobs:
           - slug: prB-alone
             label: prB-alone 2f86bfb1
             ref: 2f86bfb13f1fadeb03908147c3e9a51a07ef582c
+            whole: 'no'
           - slug: prB-plus-5984
             label: prB+5984 merge
             ref: ${{ github.sha }}
+            whole: 'yes'
+          # Control: upstream dev WITHOUT PR B at all. Run 1 saw two XAI failures on the
+          # merge leg (TestXAIExecutorExecuteVideosCreate fails, and the XAI websockets
+          # test deadlocks under -race). PR B cannot reach them -- codexStreamNow is read
+          # only by the codex SSE path -- but this leg is what proves it.
+          - slug: base-control
+            label: base cdfb79ef (no PR B)
+            ref: cdfb79ef843f0a0b236d9f479442fb776705f334
+            whole: 'yes'
     defaults:
       run:
         shell: bash
@@ -193,7 +203,7 @@ jobs:
       # ------------------------------------------------------------ prB-plus-5984
 
       - name: 'F. WHOLE executor package, -count=1 (reporter repro)'
-        if: matrix.slug == 'prB-plus-5984'
+        if: matrix.whole == 'yes'
         timeout-minutes: 11
         run: |
           set +e
@@ -210,13 +220,14 @@ jobs:
           elif [ "$rc" -eq 0 ]; then
             verdict='pass'; detail="whole package completed in ${el}s"
           else
-            verdict='FAIL'; detail="exit $rc after ${el}s; $(grep -m5 -- '--- FAIL' logs-F.txt | tr '\n' ' ' | cut -c1-250)"
+            fails=$(grep -oE -- '--- FAIL: [A-Za-z0-9_/]+' logs-F.txt | sed 's/--- FAIL: //' | sort -u | tr '\n' ' ')
+            verdict='FAIL'; detail="exit $rc after ${el}s; failing: ${fails}"
           fi
           printf 'F\twhole executor package, -count=1\t%s\t%s\n' "$verdict" "$detail" >> results.tsv
           exit 0
 
       - name: 'G. both packages, -race -count=3'
-        if: matrix.slug == 'prB-plus-5984'
+        if: matrix.whole == 'yes'
         timeout-minutes: 12
         run: |
           set +e
@@ -228,7 +239,10 @@ jobs:
             w=$(grep -c 'net\.(\*conn)\.Write' logs-G.txt)
             t=$(sed -n '/running tests:/,+6p' logs-G.txt | grep -oE 'Test[A-Za-z0-9_]+' | tr '\n' ',')
             echo '=== goroutine dump head ==='
-            sed -n '/panic: test timed out/,+60p' logs-G.txt
+            sed -n '/panic: test timed out/,+80p' logs-G.txt
+            gr=$(grep -c '^goroutine ' logs-G.txt)
+            top=$(awk '/^goroutine /{getline; sub(/\(.*/,"",$1); print $1}' logs-G.txt | sort | uniq -c | sort -rn | head -6 | tr '\n' ';' | tr -s ' ')
+            printf 'G2\t  ^ goroutine dump\t%s\t%s\n' "info" "total goroutines $gr; top entry frames: $top" >> results.tsv
             verdict='DEADLOCK'; detail="hit -timeout 8m after ${el}s; net.conn.Write: $w; running tests: ${t:-unknown}"
           elif grep -q 'WARNING: DATA RACE' logs-G.txt; then
             verdict='RACE'; detail="data race after ${el}s; $(grep -c 'WARNING: DATA RACE' logs-G.txt) report(s)"
