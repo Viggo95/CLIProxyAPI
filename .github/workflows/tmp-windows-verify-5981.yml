@@ -1,0 +1,194 @@
+# TEMPORARY — verification harness for issue #5981 (bootstrap-buffering tests on Windows).
+# Not for merge: lives only on the tmp/windows-verify-5981 branch of the fork.
+# Runs the same protocols that were used on macOS, against both the unpatched base
+# and the patched commit, so the A/B lands in one run summary.
+name: tmp-windows-verify-5981
+
+on:
+  push:
+    branches:
+      - tmp/windows-verify-5981
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: ${{ matrix.label }}
+    runs-on: windows-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: base
+            label: base cdfb79ef (unpatched)
+            ref: cdfb79ef843f0a0b236d9f479442fb776705f334
+          - slug: patched
+            label: patched ec81c0c4
+            ref: ec81c0c41937e44bdd9590c5a1cc9b8407153192
+    defaults:
+      run:
+        shell: bash
+    env:
+      # items 2, 3, 5, 6 — the five clock-race cases, deliberately excluding the
+      # item-1 deadlock test so a base-side hang there cannot mask them.
+      CLOCK_TESTS: '^TestCodex(Executor|WebsocketsExecutor)_BootstrapBuffering_(TimeBudgetReleasesStream|OverloadDirectlyAfterTimeoutDeliveredInStream|StatusBearingErrorAfterTimeoutDeliveredInStream)$'
+      ITEM1_TEST: '^TestCodexExecutor_BootstrapBuffering_ByteCapReleasesStream$'
+      FORWARDER_TEST: '^TestForwardResponsesStreamErrorEventPreservesNestedError$'
+
+    steps:
+      - name: Checkout ${{ matrix.ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Environment probe
+        run: |
+          set +e
+          go version
+          go env GOOS GOARCH CGO_ENABLED GOMAXPROCS
+          echo "cpus: $(nproc 2>/dev/null || echo '?')"
+          if gcc --version >/dev/null 2>&1; then
+            gcc --version | head -1
+            echo "RACE=-race" >> "$GITHUB_ENV"
+          else
+            echo "no gcc on PATH -> running without -race (the item 2/3/5/6 failures are"
+            echo "wrong-outcome assertion failures, not data-race reports, so they still show)"
+            echo "RACE=" >> "$GITHUB_ENV"
+          fi
+          : > results.tsv
+          exit 0
+
+      # A. What the reporter actually did: one clean run of the package.
+      - name: 'A. whole package, -count=1 (reporter repro)'
+        timeout-minutes: 12
+        run: |
+          set +e
+          go test -count=1 -timeout 8m ./internal/runtime/executor/ > logs-A.txt 2>&1
+          rc=$?
+          tail -n 150 logs-A.txt
+          if grep -q 'panic: test timed out' logs-A.txt; then
+            verdict='DEADLOCK'; detail='test binary hit its own -timeout; goroutine dump in logs-A.txt'
+          elif [ "$rc" -eq 0 ]; then
+            verdict='pass'; detail='package completed'
+          else
+            verdict='FAIL'; detail="exit $rc"
+          fi
+          printf 'A\twhole package, -count=1\t%s\t%s\n' "$verdict" "$detail" >> results.tsv
+          exit 0
+
+      # B. Item 1 in isolation — the deadlock that would not reproduce on macOS.
+      - name: 'B. item 1, ByteCapReleasesStream x20'
+        timeout-minutes: 8
+        run: |
+          set +e
+          go test -run "$ITEM1_TEST" -count=20 -timeout 4m ./internal/runtime/executor/ > logs-B.txt 2>&1
+          rc=$?
+          tail -n 150 logs-B.txt
+          if grep -q 'panic: test timed out' logs-B.txt; then
+            verdict='DEADLOCK'; detail='hung in teardown; look for net.(*conn).Write + server.Close in logs-B.txt'
+          elif [ "$rc" -eq 0 ]; then
+            verdict='pass'; detail='20/20 iterations'
+          else
+            verdict='FAIL'; detail="exit $rc"
+          fi
+          printf 'B\titem 1 isolated, -count=20\t%s\t%s\n' "$verdict" "$detail" >> results.tsv
+          exit 0
+
+      # C. Idle protocol: 1 process, -count=80, 3 reps. Caught item 5 most readily on macOS.
+      - name: 'C. clock cases, idle, -count=80 x3'
+        timeout-minutes: 20
+        run: |
+          set +e
+          green=0
+          for rep in 1 2 3; do
+            go test -run "$CLOCK_TESTS" -count=80 $RACE -timeout 6m ./internal/runtime/executor/ > "logs-C-$rep.txt" 2>&1
+            if [ $? -eq 0 ]; then green=$((green+1)); else echo "--- rep $rep failed ---"; grep -E -- '--- FAIL' "logs-C-$rep.txt" | sort -u | head -20; fi
+          done
+          printf 'C\tclock cases, idle -count=80, 3 reps\t%s\t%s\n' "$((3-green))/3 failed" "green $green/3" >> results.tsv
+          echo "green $green/3"
+          exit 0
+
+      # D. Loaded protocol: 4 concurrent processes x -count=50, 3 reps. Caught items 2 and 3 on macOS.
+      - name: 'D. clock cases, 4 concurrent x -count=50, 3 reps'
+        timeout-minutes: 25
+        run: |
+          set +e
+          total=0; green=0
+          for rep in 1 2 3; do
+            pids=''
+            for i in 1 2 3 4; do
+              go test -run "$CLOCK_TESTS" -count=50 $RACE -timeout 6m ./internal/runtime/executor/ > "logs-D-$rep-$i.txt" 2>&1 &
+              pids="$pids $!"
+            done
+            for p in $pids; do
+              total=$((total+1))
+              wait "$p"
+              if [ $? -eq 0 ]; then green=$((green+1)); fi
+            done
+          done
+          echo "green $green/$total processes"
+          grep -hE -- '--- FAIL' logs-D-*.txt 2>/dev/null | sort -u | head -20
+          printf 'D\tclock cases, 4 procs x -count=50, 3 reps\t%s\t%s\n' "$((total-green))/$total failed" "green $green/$total" >> results.tsv
+          exit 0
+
+      # E. Item 4, the forwarder flake: 4 concurrent processes x -count=200, 3 reps.
+      - name: 'E. item 4, forwarder, 4 concurrent x -count=200, 3 reps'
+        timeout-minutes: 20
+        run: |
+          set +e
+          total=0; green=0
+          for rep in 1 2 3; do
+            pids=''
+            for i in 1 2 3 4; do
+              go test -run "$FORWARDER_TEST" -count=200 $RACE -timeout 6m ./sdk/api/handlers/openai/ > "logs-E-$rep-$i.txt" 2>&1 &
+              pids="$pids $!"
+            done
+            for p in $pids; do
+              total=$((total+1))
+              wait "$p"
+              if [ $? -eq 0 ]; then green=$((green+1)); fi
+            done
+          done
+          echo "green $green/$total processes"
+          grep -h 'payload.Error.type' logs-E-*.txt 2>/dev/null | sort -u | head -10
+          printf 'E\tforwarder, 4 procs x -count=200, 3 reps\t%s\t%s\n' "$((total-green))/$total failed" "green $green/$total" >> results.tsv
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          set +e
+          {
+            echo "### ${{ matrix.label }}"
+            echo
+            echo "\`windows-latest\`, $(go version 2>/dev/null), race flag: \`${RACE:-<none>}\`"
+            echo
+            echo "| # | protocol | result | detail |"
+            echo "| --- | --- | --- | --- |"
+            while IFS=$'\t' read -r a b c d; do
+              [ -n "$a" ] && echo "| $a | $b | **$c** | $d |"
+            done < results.tsv
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat results.tsv
+          exit 0
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.slug }}
+          path: |
+            logs-*.txt
+            results.tsv
+          if-no-files-found: warn
+          retention-days: 14
